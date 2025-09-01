@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "../Matts_launch_states"
+		},
+		{
+			"name": "Halya-Electronics-Launch-State-Testing",
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"cmath": "cpp",
+			"iostream": "cpp"
+		}
+	}
+}
