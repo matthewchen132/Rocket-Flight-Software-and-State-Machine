@@ -21,6 +21,8 @@
 #include <math.h>
 #include <iostream>
 #include <sstream>
+#include <cmath>
+#include <ArduinoEigenDense.h>
 #define SEALEVELPRESSURE_HPA (1013.25)
 #define LSM_CS 38
 #define LSM_SCK 37
@@ -39,7 +41,6 @@ constexpr int num_sustained_accels = 10;
 // Task handles
 GPS GPS_NAV;
 String canMessage;
-int counter = 0;
 volatile bool pinStatusUpdated[64] = {};
 volatile int pinStatus[64][5] = {};
 JsonDocument sensorDataGlobal;
@@ -56,11 +57,23 @@ struct coord{
   double lat_;
   double long_;
 };
-
+std::vector<double> angles = {0,0,0};
+std::vector<double> ang_vel;
 static double altitude;
+double ax_sum, ay_sum, az_sum = 0.0;
+
+//IMU data structures + Kalman Filter
 static std::vector<double> accels;
 double net_accel;
 static imu_output imu_data;
+static double A[3][3] = {{.9989,.0023,-.0021},
+                          {-.0004,1.0029, 0.0123},
+                          {-.0803,-.0015,0.9980}};
+static double b[3] = {-0.1307,-0.0937,0.4210};
+// static double b[3] = {-0.1307,-0.0937, (0.4210-.283) }; // <- manually adjusted for zeroing g.
+double z_state[3] = {0,0,0};
+double sample_count = 0;
+
 static coord gps_data;
 SemaphoreHandle_t altMutex = xSemaphoreCreateMutex(); // dataserialize
 SemaphoreHandle_t imuMutex = xSemaphoreCreateMutex();
@@ -74,17 +87,27 @@ int canTXRXcount[2] = {0, 0};
 String messageToCAN(String code);
 LaunchState current_state1 = LaunchState::PreIgnition;
 SixDOF _6DOF;
-// MPU9250 mpu;
+static double dt = _6DOF.read_delay/1000.0;
+// static double F[3][3] = {{1.0, dt, -0.5*dt*dt },
+//                         {0, 1.0, -dt},
+//                           {0.0, 0.0, 1.0}};
+                          
+// double P[3][3] = {
+//   {1.0, 0.0, 0.0},   // 1 m² uncertainty in altitude
+//   {0.0, 1.0, 0.0},   // 1 (m/s)² uncertainty in velocity
+//   {0.0, 0.0, 0.01}   // small variance in bias estimate
+// };
+                          // MPU9250 mpu;
 TwoWire I2C1(0); // Default I2C bus
 PHT Alt(I2C1);
 TwoWire I2C2(1);                       // Secondary I2C bus
 uint16_t measurement_delay_us = 65535; // Delay between measurements for testing
 GPS GPS1;
-// LaunchState Halya;
 int groundLevelAltitudeTest = 0;
 std::map<string, bool> statesMapTest;
 double AltArrayTest[10];
 double previousMedianTest = 0;
+double alpha = 0.884;
 bool CHECK = false;
 const int rows = 4;
 const int cols = 50;
@@ -243,11 +266,260 @@ double calculateRateOfChangeTest(double AltArray[], int READINGS_LENGTH)
 
   return rate_of_change;
 }
+std::array<std::array<double,3>,3> rotation_body_to_world(double roll_deg, double pitch_deg, double yaw_deg) {
+    double roll  = roll_deg  * M_PI / 180.0;
+    double pitch = pitch_deg * M_PI / 180.0;
+    double yaw   = yaw_deg   * M_PI / 180.0;
 
-// RX Code
+    double cr = cos(roll),  sr = sin(roll);
+    double cp = cos(pitch), sp = sin(pitch);
+    double cy = cos(yaw),   sy = sin(yaw);
+
+    std::array<std::array<double,3>,3> R {{
+        {cp*cy,              sr*sp*cy - cr*sy,   cr*sp*cy + sr*sy},
+        {cp*sy,              sr*sp*sy + cr*cy,   cr*sp*sy - sr*cy},
+        {-sp,                sr*cp,              cr*cp}
+    }};
+    return R;
+}
 int num_decreasing_alts = 0;
-int rocCount = 0;
 
+uint8_t extraPrecision(double dataValue)
+{
+  int integerPart = static_cast<int>(dataValue);
+  double decimalPart = dataValue - integerPart;
+  int scaledDecimal = static_cast<int>(decimalPart * 10000);
+  int filteredDecimal = scaledDecimal % 100;
+  uint8_t hexValue = 0x00 + static_cast<uint8_t>(filteredDecimal);
+  return hexValue;
+}
+double returnAverageTest(double arr[], int number)
+{
+  double sum = 0;
+  for (int count = 0; count < number - 1; count++)
+  {
+    sum += arr[count];
+  }
+  return sum / number;
+}
+// TWAI/CAN RECIEVE MESSAGE
+void commandTask(String can_code)
+{
+  // String canMessage = *(String *)pvParameters;  // Cast and dereference the passed parameter for FreeRTOS specific format
+
+  while (1)
+  {
+    // Using the passed message
+    String message = can_code;
+
+    // Extract solboardIDnum, command, and mode from the message
+    String solboardIDnum = message.substring(0, message.length() - 2);
+    char command = message[message.length() - 2];
+    char mode = message[message.length() - 1];
+
+    switch (command)
+    {
+    case '0':
+    case '1':
+    case '2':
+    case '3':
+    case '4':
+      command2pin(solboardIDnum, command, mode); // sends command to activate the solenoid HIGH
+      break;
+    default:
+      vTaskDelay(10 / portTICK_PERIOD_MS); // Delay for a while
+      yield();
+      vTaskDelay(10);
+    }
+  }
+}
+void printTwaiStatus()
+{
+  twai_status_info_t status;
+  twai_get_status_info(&status);
+  Serial.print("Status:  ");
+  switch (status.state)
+  {
+  case (TWAI_STATE_STOPPED):
+    Serial.println("Stopped");
+    break;
+  case (TWAI_STATE_RUNNING):
+    Serial.println("Running");
+    break;
+  case (TWAI_STATE_BUS_OFF):
+    Serial.println("Bus Off");
+    break;
+  case (TWAI_STATE_RECOVERING):
+    Serial.println("Recovering");
+    break;
+  default:
+    Serial.println("Unknown");
+    break;
+  }
+  Serial.print("Tx Error Counter: ");
+  Serial.println(status.tx_error_counter);
+  Serial.print("Rx Error Counter: ");
+  Serial.println(status.rx_error_counter);
+  Serial.print("Bus Error Count: ");
+  Serial.println(status.bus_error_count);
+  Serial.print("Messages to Tx: ");
+  Serial.println(status.msgs_to_tx);
+  Serial.print("Messages to Rx: ");
+  Serial.println(status.msgs_to_rx);
+}
+void start_twai(){
+  
+pinMode(CAN_TX, OUTPUT);
+pinMode(CAN_RX, INPUT);
+// Config CAN Speed
+twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX, (gpio_num_t)CAN_RX, TWAI_MODE_NORMAL);
+twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS(); // TWAI_TIMING_CONFIG_500KBITS();
+twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+// Install and start the TWAI driver
+esp_err_t canStatus = twai_driver_install(&g_config, &t_config, &f_config);
+if (canStatus == ESP_OK)
+{
+  Serial.println("CAN Driver installed");
+}
+else
+{
+  Serial.println("CAN Driver installation failed");
+}
+if (twai_start() != ESP_OK)
+{
+  Serial.println("Error starting TWAI!");
+}
+// starts TWAI
+Serial.println("Staring CAN bus...");
+ESP32Can.setRxQueueSize(8);
+ESP32Can.setTxQueueSize(8);
+}
+// RTOS TASKS:
+void AltimeterTask(void *mutex){
+  auto Mutex = static_cast<SemaphoreHandle_t>(mutex);
+  configASSERT(Mutex);
+  TickType_t altimeter_delay = pdMS_TO_TICKS(Alt.dt);
+  while(1){
+    if(xSemaphoreTake(Mutex, portMAX_DELAY)){ // take the mutex if not occupied and delay indefinitely while modifying altitude.
+      altitude = Alt.getAltitude();
+      // Serial.println(String(altitude));
+      xSemaphoreGive(Mutex);
+    }
+    vTaskDelay(altimeter_delay);
+  }
+}
+void IMU6_Task(void *mutex){
+  auto Mutex = static_cast<SemaphoreHandle_t>(mutex);
+  configASSERT(Mutex);
+  TickType_t IMU_delay = pdMS_TO_TICKS(_6DOF.read_delay); // IMU Reading delay
+  double kalman_bias = -.27;
+  static bool initialized = false;
+  static Eigen::Vector3d x;          // [z, dz, bias].Transpose
+  static Eigen::Matrix3d P;          // covariance
+  Eigen::Matrix3d F;
+  Eigen::RowVector3d H; 
+  Eigen::RowVector3d z_predicted;
+  Eigen::Matrix3d Q;
+  while(1){
+    if (altitude > 30000){
+      vTaskDelay(IMU_delay);
+      continue;; // During initial readings, altimeter returns nonsense value of "44300", causing rly wrong initial guess/oscillation.
+    }
+    if(xSemaphoreTake(Mutex,portMAX_DELAY)){
+      accels = _6DOF.getAcceleration();
+      net_accel = _6DOF.getNetAccel();
+      ang_vel = _6DOF.getGyro();
+      sample_count +=1;
+      //calibrating biases:
+      angles[0] += (180/PI)*(ang_vel[0]-0.000253623)*IMU_delay/1000;
+      angles[1] += (180/PI)*ang_vel[1]*IMU_delay/1000;
+      angles[2] += (180/PI)*(ang_vel[2])*IMU_delay/1000;
+      double axr = accels[0] -b[0];
+      double ayr = accels[1] -b[1];
+      double azr = accels[2] -b[2];
+      double axc = A[0][0]*axr + A[0][1]*ayr + A[0][2]*azr;
+      double ayc = A[1][0]*axr + A[1][1]*ayr + A[1][2]*azr;
+      double azc = A[2][0]*axr + A[2][1]*ayr + A[2][2]*azr;
+      double roll_acc  = atan2(ayc, azc);
+      double pitch_acc = atan2(-axc, sqrt(ayc*ayc + azc*azc));
+      angles[0] = alpha * angles[0] + (1.0 - alpha) * roll_acc*180/PI;
+      angles[1] = alpha * angles[1] + (1.0 - alpha) * pitch_acc*180/PI;
+      auto R = rotation_body_to_world(angles[0], angles[1], angles[2]);
+      double axw = R[0][0]*axc + R[0][1]*ayc + R[0][2]*azc;
+      double ayw = R[1][0]*axc + R[1][1]*ayc + R[1][2]*azc;
+      double azw = R[2][0]*axc + R[2][1]*ayc + R[2][2]*azc;
+      //Set the initial state, etc.
+      if(!initialized){
+        x << altitude, 0, kalman_bias;
+        //initial covariances about the relationships of z, dz.dt, bias(?)
+        P << 4.0,   0,   0,
+            0,   2.0,   0,
+            0,   0, 0.01;
+        F << 1,  dt, -0.5*dt*dt, // State transition matrix F
+            0,  1,  -dt,
+            0,  0,   1;
+        H << 1, 0, 0;   //Measurement Mapping
+        initialized = true;
+      }
+      // Kalman Prediction Step
+      double z_pred = x[0] + x[1]*dt + 0.5*(azw -9.81 -x[2])*dt*dt;
+      double dzdt_pred = x[1] + (azw -9.81 -x[2])*dt;
+      double kalman_bias_next = x[2];
+      z_predicted <<  z_pred, dzdt_pred, kalman_bias_next;
+      // Process noise covariance Q  
+      Q << 0.25*pow(dt,4)*_6DOF.azw_variance,  0.5*pow(dt,3)*_6DOF.azw_variance,  0,
+          0.5*pow(dt,3)*_6DOF.azw_variance,   dt*dt*_6DOF.azw_variance,          0,
+          0,                         0,                       _6DOF.bias_variance*dt;
+      // Z Measurement Update:
+      double z_measured = altitude;
+      // Innovation (residual between the measurement and the predicted state. in 1D, just measured height and predicted.)
+      double y = z_measured - z_pred; 
+      // Innovation Covariance
+      Eigen::Matrix3d P_pred = F*P*F.transpose() + Q;
+      double S = (H *P_pred * H.transpose())(0,0) + Alt.R; //covariance of innovation/residual = H*P*H.T + R, Alt.R = R = 0.148251666m^2;
+      
+      //Compute Kalman Gain
+      Eigen::Vector3d KG = (P_pred * H.transpose()) * (1/S); // Typically P_pred * H_Transpose * S^-1  
+
+      //State Estimate Correction
+      Eigen::Vector3d z_post = z_predicted.transpose() + KG*y; // z_pred is double, error.
+      Eigen::Matrix3d I;
+      I << 1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0;
+      Eigen::Matrix3d KG_H = KG * H;
+      Eigen::Matrix3d P_post = (I -KG_H) * P_pred * (I - KG_H).transpose() + KG * Alt.R * KG.transpose();
+
+      // enforce symmetricity
+      P_post = 0.5 * (P_post + P_post.transpose());
+      x[0] = z_post[0];
+      x[1] = z_post[1];
+      x[2] = z_post[2];
+      P = P_post;
+      // Serial.println(String(x[0]) + ";" + String(x[1]) + ";" + String(x[2]) + ";" + String(y));
+      Serial.print(x[0]);
+      Serial.print(" ");
+      Serial.print(altitude);
+      Serial.print(" ");
+      // Serial.print(y); <- Residual
+      Serial.println();
+      xSemaphoreGive(Mutex);
+    }
+    vTaskDelay(IMU_delay);
+  }
+}
+void GPS_Task(void *mutex){ // NOTE: This task is simulating gps values. Values are NOT ACCURATE!!!
+  auto Mutex = static_cast<SemaphoreHandle_t>(mutex);
+  while(1){
+    if(xSemaphoreTake(Mutex, portMAX_DELAY)){
+      gps_data.lat_ = 32.2;
+      gps_data.long_ = 34.2;
+      // Serial.println("GPS (100ms Delay):" + String(gps_data.lat_) + "," + String(gps_data.long_)); 
+      xSemaphoreGive(Mutex);
+    }
+    vTaskDelay(100); 
+  }
+}
 void BabyStateMachine(void *stateMachineMutex){
   while(1){
     switch (current_state1){
@@ -382,6 +654,7 @@ void BabyStateMachine(void *stateMachineMutex){
       */
       if(xSemaphoreTake(altMutex,0) ==pdTRUE){
         double best_altitude = altitude;
+        _6DOF.azw_variance *= 100.0; // boost the overshoot during specific launch states, then bring down.
         xSemaphoreGive(altMutex);
         vTaskDelay(pdMS_TO_TICKS(11)); // delay to get a refreshed altitude reading to compare to.
         if(altitude - best_altitude <=0){
@@ -392,6 +665,7 @@ void BabyStateMachine(void *stateMachineMutex){
         }
       }
       if(num_decreasing_alts >= N_DEC){
+        _6DOF.azw_variance /= 100.0; // boost the overshoot during
         current_state1 = LaunchState::_1000ft;
         Serial.println("\nApogee was Detected!");
         command2pin("06", '2', '1'); // CORRESPONDING PIN TO DROGUE EMATCH
@@ -410,84 +684,6 @@ void BabyStateMachine(void *stateMachineMutex){
       }
       break;
     }
-    // case LaunchState::_900ft:
-    // {
-    //   double PHT_alt = _Alt.getAltitude();
-    //   double GPS_alt = _GPS1.getAltitude();
-    //   double bottom_alt = bottomAlt;
-    //   bool PHT_error = (PHT_alt == 0);
-    //   bool GPS_error = !(_GPS1.fix);
-    //   bool bottom_error = (bottom_alt == 0);
-    //   double final_altitude = 0;
-    //   if (!PHT_error && !GPS_error)
-    //   {
-    //     final_altitude = (PHT_alt + GPS_alt) / 2;
-    //   }
-    //   else if (!PHT_error)
-    //   {
-    //     final_altitude = PHT_alt;
-    //   }
-    //   else if (!GPS_error)
-    //   {
-    //     final_altitude = GPS_alt;
-    //   }
-    //   else if (!bottom_error)
-    //   {
-    //     final_altitude = bottom_alt;
-    //   }
-    //   else
-    //   {
-    //     break;
-    //   }
-    //   Serial.println("Current Altitude: " + String(final_altitude) + " ft");
-    //   // Transition when below 900 ft
-    //   if (final_altitude < 900)
-    //   {
-    //     Serial.println("900 ft threshold reached! Moving to 800 ft state.");
-    //     command2pin("06", '1', '1'); // Next parachute action
-    //     current_state1 = LaunchState::_800ft;
-    //   }
-    //   break;
-    // }
-    // case LaunchState::_800ft:
-    // {
-    //   double PHT_alt = _Alt.getAltitude();
-    //   double GPS_alt = _GPS1.getAltitude();
-    //   double bottom_alt = bottomAlt;
-    //   bool PHT_error = (PHT_alt == 0);
-    //   bool GPS_error = !(_GPS1.fix);
-    //   bool bottom_error = (bottom_alt == 0);
-    //   double final_altitude = 0;
-    //   if (!PHT_error && !GPS_error)
-    //   {
-    //     final_altitude = (PHT_alt + GPS_alt) / 2;
-    //   }
-    //   else if (!PHT_error)
-    //   {
-    //     final_altitude = PHT_alt;
-    //   }
-    //   else if (!GPS_error)
-    //   {
-    //     final_altitude = GPS_alt;
-    //   }
-    //   else if (!bottom_error)
-    //   {
-    //     final_altitude = bottom_alt;
-    //   }
-    //   else
-    //   {
-    //     break;
-    //   }
-    //   Serial.println("Current Altitude: " + String(final_altitude) + " ft");
-    //   // Transition when below 800 ft
-    //   if (final_altitude < 800)
-    //   {
-    //     Serial.println("800 ft threshold reached! Moving to descent phase.");
-    //     command2pin("06", '2', '1'); // Final parachute action
-    //     current_state1 = LaunchState::Descent;
-    //   }
-    //   break;
-    // }
     case LaunchState::Descent:
     {
       command2pin("06", '3', '1'); // MAIN CHUTE Deployment
@@ -505,159 +701,7 @@ void BabyStateMachine(void *stateMachineMutex){
     vTaskDelay(10);
   }
 }
-
-uint8_t extraPrecision(double dataValue)
-{
-  int integerPart = static_cast<int>(dataValue);
-  double decimalPart = dataValue - integerPart;
-  int scaledDecimal = static_cast<int>(decimalPart * 10000);
-  int filteredDecimal = scaledDecimal % 100;
-  uint8_t hexValue = 0x00 + static_cast<uint8_t>(filteredDecimal);
-  return hexValue;
-}
-double returnAverageTest(double arr[], int number)
-{
-  double sum = 0;
-  for (int count = 0; count < number - 1; count++)
-  {
-    sum += arr[count];
-  }
-  return sum / number;
-}
-// TWAI/CAN RECIEVE MESSAGE
-void commandTask(String can_code)
-{
-  // String canMessage = *(String *)pvParameters;  // Cast and dereference the passed parameter for FreeRTOS specific format
-
-  while (1)
-  {
-    // Using the passed message
-    String message = can_code;
-
-    // Extract solboardIDnum, command, and mode from the message
-    String solboardIDnum = message.substring(0, message.length() - 2);
-    char command = message[message.length() - 2];
-    char mode = message[message.length() - 1];
-
-    switch (command)
-    {
-    case '0':
-    case '1':
-    case '2':
-    case '3':
-    case '4':
-      command2pin(solboardIDnum, command, mode); // sends command to activate the solenoid HIGH
-      break;
-    default:
-      vTaskDelay(10 / portTICK_PERIOD_MS); // Delay for a while
-      yield();
-      vTaskDelay(10);
-    }
-  }
-}
-void printTwaiStatus()
-{
-  twai_status_info_t status;
-  twai_get_status_info(&status);
-  Serial.print("Status:  ");
-  switch (status.state)
-  {
-  case (TWAI_STATE_STOPPED):
-    Serial.println("Stopped");
-    break;
-  case (TWAI_STATE_RUNNING):
-    Serial.println("Running");
-    break;
-  case (TWAI_STATE_BUS_OFF):
-    Serial.println("Bus Off");
-    break;
-  case (TWAI_STATE_RECOVERING):
-    Serial.println("Recovering");
-    break;
-  default:
-    Serial.println("Unknown");
-    break;
-  }
-  Serial.print("Tx Error Counter: ");
-  Serial.println(status.tx_error_counter);
-  Serial.print("Rx Error Counter: ");
-  Serial.println(status.rx_error_counter);
-  Serial.print("Bus Error Count: ");
-  Serial.println(status.bus_error_count);
-  Serial.print("Messages to Tx: ");
-  Serial.println(status.msgs_to_tx);
-  Serial.print("Messages to Rx: ");
-  Serial.println(status.msgs_to_rx);
-}
-void start_twai(){
-  
-pinMode(CAN_TX, OUTPUT);
-pinMode(CAN_RX, INPUT);
-// Config CAN Speed
-twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX, (gpio_num_t)CAN_RX, TWAI_MODE_NORMAL);
-twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS(); // TWAI_TIMING_CONFIG_500KBITS();
-twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-// Install and start the TWAI driver
-esp_err_t canStatus = twai_driver_install(&g_config, &t_config, &f_config);
-if (canStatus == ESP_OK)
-{
-  Serial.println("CAN Driver installed");
-}
-else
-{
-  Serial.println("CAN Driver installation failed");
-}
-if (twai_start() != ESP_OK)
-{
-  Serial.println("Error starting TWAI!");
-}
-// starts TWAI
-Serial.println("Staring CAN bus...");
-ESP32Can.setRxQueueSize(8);
-ESP32Can.setTxQueueSize(8);
-}
-// RTOS TASKS:
-void AltimeterTask(void *mutex){
-  auto *Mutex = static_cast<SemaphoreHandle_t>(mutex);
-  configASSERT(Mutex);
-  TickType_t altimeter_delay = pdMS_TO_TICKS(100);
-  while(1){
-    if(xSemaphoreTake(Mutex, portMAX_DELAY)){ // take the mutex if not occupied and delay indefinitely while modifying altitude.
-      altitude = Alt.getAltitude();
-      // Serial.println("Altimeter (100ms Delay):" + String(altitude));
-      xSemaphoreGive(Mutex);
-    }
-    vTaskDelay(altimeter_delay);
-  }
-}
-void IMU6_Task(void *mutex){
-  auto *Mutex = static_cast<SemaphoreHandle_t>(mutex);
-  configASSERT(Mutex);
-  TickType_t IMU_delay = pdMS_TO_TICKS(25); // IMU Reading delay
-  while(1){
-    if(xSemaphoreTake(Mutex,portMAX_DELAY)){
-      accels = _6DOF.getAcceleration();
-      net_accel = _6DOF.getNetAccel();
-      // Serial.println("IMU net acceleration (25ms Delay):" + String(net_accel));
-      xSemaphoreGive(Mutex);
-    }
-    vTaskDelay(IMU_delay);
-  }
-}
-void GPS_Task(void *mutex){ // NOTE: This task is simulating gps values. Values are NOT ACCURATE!!!
-  auto *Mutex = static_cast<SemaphoreHandle_t>(mutex);
-  while(1){
-    if(xSemaphoreTake(Mutex, portMAX_DELAY)){
-      gps_data.lat_ = 32.2;
-      gps_data.long_ = 34.2;
-      // Serial.println("GPS (100ms Delay):" + String(gps_data.lat_) + "," + String(gps_data.long_)); 
-      xSemaphoreGive(Mutex);
-    }
-    vTaskDelay(100); 
-  }
-}
-
-void setup(){
+void setup() {
 Serial.begin(115200);
   while (!Serial){
   Serial.print("Serial Failed to start");
@@ -683,11 +727,13 @@ delay(10);
 
 //RTOS Tasks:
   // Core 0: Sensor Concurrency
+  delay(20);
   xTaskCreatePinnedToCore(AltimeterTask, "read_altimeter", 2048, altMutex, 2, nullptr, 0);
+  delay(20);
   xTaskCreatePinnedToCore(IMU6_Task, "Six_DOF_Task", 4096, imuMutex, 1, nullptr, 0); 
   xTaskCreatePinnedToCore(GPS_Task, "GPS_Task", 2048, gpsMutex, 3, nullptr, 0); 
   // Core 1: State Machine
-  xTaskCreatePinnedToCore(BabyStateMachine, "GPS_Task", 2048, stateMachineMutex, 4, nullptr, 1); 
+  // xTaskCreatePinnedToCore(BabyStateMachine, "GPS_Task", 2048, stateMachineMutex, 4, nullptr, 1); 
 }
 
 void loop(){

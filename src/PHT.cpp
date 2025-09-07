@@ -1,6 +1,11 @@
 #include "PHT.h"
 #define SEA_LEVEL_PRESSURE_PA 101325.0
-
+constexpr float R = 0.06139392;//Measurement Noise (R).
+constexpr float dt = 10.0; //sample rate in ms.
+constexpr float F[2][2] = {
+                           {1, dt}, 
+                           {0, 1}     
+                          };
 // Remove this constructor definition if it is already defined in the header file or elsewhere.
 bool PHT::connectSensor()
 {
@@ -39,6 +44,7 @@ void PHT::updateData()
 }
 double PHT::getPressTempRTOS(){
   barometer.checkUpdates(); // 8-8-25 Matthew Addition
+  return 0.0; // wip
 }
 
 void PHT::printData()
@@ -89,32 +95,9 @@ double PHT::getKalmanFilteredAltitude(float measurementNoise, float processNoise
   P = error;  
 }
 
-double PHT::update_1D(float Z, float Q, float R,  float time_elapsed){
-    // Q how much your state might drift between measurements
-    /* R is MEASUREMENT variance, think "how much could my altitude change in the next time step while holding still"? measures in units of variance (state units)^2
-        Say that we know altitude changes +- 1.2 meters per reading. variance = 1.2^2
-
-        In future, Find Q through sampling Q 1000 times, calculating mean, and finding average distance of each point from the mean. 
-          numerator += (x_mean - x_n)**2
-          std_dev_x_n = sqrt((numerator)/(1000))
-    */
-    // Z is the MEASUREMENT
-    // X is the PREDICTION, found through PHT.getAltitude()
-    // P is ESTIMATE variance
-
-    // finds initial x value
-    if(!hasInitialValue){
-      x = Z; // Z is the measurement we got from getAltitude() in the main function
-      P = 5 * 1.44; // set the Estimate variance to be 5 * the Measurement vairance, low trust in the original readings.
-      hasInitialValue = true;
-    }
-
-    P = P + Q;
-    // compute the Kalman gain (K), 
-    float K = P / (P+R);
-    // compute the estimate of altitude by adding previous height + kalman_gain*(difference between measurement and previous)
-    x = x + K*(Z - x);
-    return x;
+double PHT::update_1D(float process_noise_Q, float accel_z, float dt_ms){
+  //Sensor Noise is already found through idle height variance^2 (R = 0.06139392)
+  double sigma_a = accel_z * accel_z;
 }
 
 double PHT::update_2D(){

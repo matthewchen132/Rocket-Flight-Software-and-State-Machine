@@ -10,8 +10,6 @@ class PHT
 {
 public:
     PHT(TwoWire &i2c): i2cBus(i2c), barometer(&i2c){
-        R = 0.031754118; // std. deviation ~ 0.178 <- Measurement deviations found through recording static points
-        P = 10*R; // I don't really trust the initial measurement, make the variance at 5 x the known sensor variance
         std::cout << "Used Default Constructor";
     };
     bool connectSensor();
@@ -24,11 +22,12 @@ public:
     double getAltitude();
     double getSeaLevelPressure();
     double getKalmanFilteredAltitude(float measurementNoise, float processNoise, float estimate, float error);
-    double update_1D(float measurement, float Q, float R, float time_elapsed); // <- Stationary
+    double update_1D(float process_noise_Q, float accel_z, float dt_ms); // <- Stationary
     double update_2D(); // <- Moving
     double hasInitialValue = false;
-    double x = 0.00;
-    double R = 0.031754118;
+    double R = 0.06139392;//Measurement Noise (R).
+    double dt = 10.0; //10ms delay
+    double x = 0.0;
     double P = 10*R; // I don't really trust the initial measurement, make the estimate variance at 5 x the known sensor variance 
 
 private:

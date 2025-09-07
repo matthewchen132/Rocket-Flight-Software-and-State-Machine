@@ -6,7 +6,6 @@
 #include <SimpleKalmanFilter.h>
 // For SPI mode, we need a CS pin
 #define LSM_CS 39
-// For software-SPI mode we need SCK/MOSI/MISO pins
 #define LSM_SCK 37
 #define LSM_SDO 35
 #define LSM_SDA 36
@@ -168,7 +167,9 @@ bool SixDOF::checkReadings()
   }
   return false;
 }
-
+double predict_alt(double measurement_noise, double z_accel, double curr_alt, double poll_rate){
+  double predicted_alt = curr_alt + z_accel*poll_rate;
+}
 // need to call manually in main.cpp file
 // void SixDOF::updateQuaternionFilter()
 // {
